@@ -1,0 +1,21 @@
+services:
+  vlapruner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vlapruner-openvla:latest
+    shm_size: "16gb"
+    ipc: host
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      MUJOCO_GL: egl
+      HF_HOME: /workspace/.cache/huggingface
+    volumes:
+      - ./src/openvla/checkpoints:/workspace/src/openvla/checkpoints:ro
+      - ./src/openvla/experiments/logs:/workspace/src/openvla/experiments/logs
+      - ./src/openvla/rollouts_dev:/workspace/src/openvla/rollouts_dev
+      - ./.cache/huggingface:/workspace/.cache/huggingface
+    working_dir: /workspace/src/openvla
+    command: bash

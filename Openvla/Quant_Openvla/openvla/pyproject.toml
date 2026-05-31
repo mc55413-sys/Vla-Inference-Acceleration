@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openvla"
+authors = [
+    {name = "Moo Jin Kim", email="moojink@stanford.edu"},
+    {name = "Karl Pertsch", email="pertsch@berkeley.edu"},
+    {name = "Siddharth Karamcheti", email="skaramcheti@cs.stanford.edu"},
+]
+description = "OpenVLA: Vision-Language-Action Models for Robotics — Calibration-Free Quantization"
+version = "0.0.3"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["vision-language-actions models", "quantization", "robot learning"]
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "transformers==4.40.1",
+    "timm==0.9.10",
+    "tokenizers==0.19.1",
+    "sentencepiece==0.1.99",
+    "numpy>=1.26.0",
+    "pillow",
+    "tqdm",
+    "accelerate>=0.25.0",
+    "einops",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.2.0",
+    "ruff>=0.2.2",
+]
+server = [
+    "uvicorn",
+    "fastapi",
+    "json-numpy",
+]
+profiling = [
+    "pandas>=2.0.0",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"prismatic" = ["py.typed"]
+
+[tool.black]
+line-length = 121
+target-version = ["py310"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "RUF", "W"]
+ignore = ["F722"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]

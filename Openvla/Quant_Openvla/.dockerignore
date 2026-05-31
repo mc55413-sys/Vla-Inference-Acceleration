@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Conda
+environment.yml
+
+# Artifacts
+checkpoints/
+rollouts/
+out/
+*.mp4
+*.safetensors
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# Docker
+Dockerfile
+.dockerignore

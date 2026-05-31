@@ -1,0 +1,31 @@
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.DS_Store
+
+# Keep Docker builds small. Mount checkpoints/results from the host at runtime.
+src/openvla/checkpoints
+src/openvla/rollouts_dev
+src/openvla/experiments/logs
+
+# Large or generated model artifacts that should not be baked into the image.
+**/*.safetensors
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.mp4
+**/*.avi
+**/*.mov
+
+# Local virtual environments and caches.
+.venv
+venv
+env
+cache
+.cache
+wandb

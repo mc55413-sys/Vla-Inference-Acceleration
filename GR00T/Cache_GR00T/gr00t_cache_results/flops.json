@@ -1,0 +1,29 @@
+{
+  "backbone": {
+    "num_layers": 12,
+    "d_model": 2048,
+    "ffn_dim": 6144,
+    "text_tokens": 80,
+    "visual_tokens": 768,
+    "reuse_ratio": 0.5,
+    "full_flops": 462157774848,
+    "cached_flops": 244121075712.0,
+    "projection_saved_flops": 38654705664.0,
+    "attention_saved_flops": 24763170816.0,
+    "total_saved_flops": 63417876480.0,
+    "flops_reduction_percent": 47.17797925345095,
+    "full_tflops": 0.462157774848,
+    "cached_tflops": 0.244121075712,
+    "saved_tflops": 0.06341787648
+  },
+  "dit": {
+    "full_gflops": 3534.326464512,
+    "full_tflops": 3.534326464512,
+    "num_layers": 16,
+    "num_steps": 8,
+    "query_tokens": 49,
+    "condition_tokens": 848
+  },
+  "total_gflops": 3778.4475402239996,
+  "total_tflops": 3.778447540224
+}

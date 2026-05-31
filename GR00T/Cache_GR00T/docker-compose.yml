@@ -1,0 +1,126 @@
+# ============================================================================
+# GR00T-Cache Docker Compose
+#
+# Usage:
+#   docker compose run --rm download-model    # Download model weights first
+#   docker compose up server-cache            # Start cache-enabled server
+#   docker compose up server-baseline         # Start baseline server
+#   docker compose run --rm eval              # Run LIBERO evaluation
+#
+# Environment variables (optional):
+#   MODEL_PATH=/path/to/model   (default: /workspace/models/gr00t)
+#   PORT=5556
+#   STEPS=8
+# ============================================================================
+
+services:
+  # ── Download model from HuggingFace ────────────────────────────────
+  download-model:
+    build: .
+    image: gr00t-cache:latest
+    environment:
+      - HF_HOME=/workspace/models/.cache
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - model-data:/workspace/models
+    command: |
+      bash -c "
+        pip install huggingface_hub &&
+        python -c \"
+          from huggingface_hub import snapshot_download
+          path = snapshot_download('nvidia/GR00T-N1.5-3B', repo_type='model')
+          print(f'Model: {path}')
+        \"
+      "
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── GR00T Inference Server (Baseline — no cache) ───────────────────
+  server-baseline:
+    build: .
+    image: gr00t-cache:latest
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/workspace/models/gr00t}
+      - PORT=${PORT:-5556}
+      - STEPS=${STEPS:-8}
+    ports:
+      - "5556:5556"
+    volumes:
+      - model-data:/workspace/models
+      - ./results:/workspace/results
+    command: /usr/local/bin/run-server-baseline
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import zmq; ctx=zmq.Context(); s=ctx.socket(zmq.REQ); s.connect('tcp://localhost:5556'); s.send(b'ping'); print(s.recv())"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── GR00T Inference Server (Cache) ─────────────────────────────────
+  server-cache:
+    build: .
+    image: gr00t-cache:latest
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/workspace/models/gr00t}
+      - PORT=${PORT:-5557}
+      - STEPS=${STEPS:-8}
+      - REUSE=${REUSE:-0.5}
+      - TOPK=${TOPK:-5}
+    ports:
+      - "5557:5557"
+    volumes:
+      - model-data:/workspace/models
+      - ./results:/workspace/results
+    command: /usr/local/bin/run-server-cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import zmq; ctx=zmq.Context(); s=ctx.socket(zmq.REQ); s.connect('tcp://localhost:5557'); s.send(b'ping'); print(s.recv())"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── LIBERO Eval Client ─────────────────────────────────────────────
+  eval:
+    build: .
+    image: gr00t-cache:latest
+    environment:
+      - HOST=${HOST:-host.docker.internal}
+      - PORT=${PORT:-5556}
+      - SUITE=${SUITE:-libero_spatial}
+      - OUTPUT=${OUTPUT:-/workspace/results/eval.json}
+    volumes:
+      - ./results:/workspace/results
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    command: /usr/local/bin/run-eval
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - eval
+
+volumes:
+  model-data:
