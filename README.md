@@ -1,4 +1,4 @@
-# ATC — Adaptive Token Caching, Pruning & Quantization for VLA Models
+# Adaptive Token Caching, Pruning & Quantization for VLA Models
 
 A collection of optimization techniques for Vision-Language-Action (VLA) models, targeting faster inference, reduced memory footprint, and efficient deployment. The project spans two model families — **NVIDIA GR00T N1.5** and **OpenVLA 7B** — with three optimization axes: caching, pruning, and quantization.
 
@@ -210,14 +210,6 @@ All GR00T variants output per-step latency breakdowns:
 | End to End | Total wall-clock latency |
 | Model Latency | Vision + Reasoning + Action (GPU-only) |
 
-## Choosing a Variant
 
-| Goal | Recommended Variant | Expected Benefit |
-|------|-------------------|-----------------|
-| Reduce inference latency with minimal accuracy loss | Cache_GR00T | ~30% DiT latency reduction |
-| Reduce LLM computation by pruning visual tokens | Prune_GR00T | ~50% visual token reduction |
-| Minimize GPU memory with quantization | Quant_GR00T | W4 precision, ~75% model size reduction |
-| Prune OpenVLA with FastV + prefill attention | Prune_Openvla | Adaptive visual token pruning |
-| Quantize OpenVLA without calibration data | Quant_Openvla | W8A16/W8A8/W4A16, no calibration needed |
 
 
