@@ -1,4 +1,4 @@
-# VLA-Pruner Docker Run Guide
+# Docker Run Guide
 
 This project has been packaged as a Docker-based workflow. The image internally creates a Conda virtual environment `vlapruner`, installs OpenVLA/VLA-Pruner code and LIBERO evaluation dependencies, and defaults to the `src/openvla` working directory.
 
@@ -66,7 +66,7 @@ The working directory should be:
 /workspace/src/openvla
 ```
 
-## 4. Run VLA-Pruner on LIBERO-Spatial
+## 4. Run on LIBERO-Spatial
 
 Full evaluation command:
 
