@@ -19,7 +19,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gr00t.experiment.data_config import load_data_config
-from gr00t.model.fastv import estimate_transformer_tflops, infer_visual_token_indices
 from gr00t.model.policy import Gr00tPolicy, squeeze_dict_values, unsqueeze_dict_values
 from tools.pruning_bench_common import (
     parameter_bytes,
@@ -152,33 +151,6 @@ def dtype_bits(model: torch.nn.Module) -> int | None:
     return None
 
 
-def infer_tflops_inputs(policy: Gr00tPolicy, backbone_inputs, args: argparse.Namespace) -> dict[str, Any]:
-    language_model = policy.model.backbone.eagle_model.language_model
-    text_config = language_model.config
-    input_ids = backbone_inputs["eagle_input_ids"]
-    visual_indices, _start, image_length, _contiguous = infer_visual_token_indices(
-        input_ids,
-        policy.model.backbone.eagle_model.image_token_index,
-        args.image_token_start_index,
-        args.image_token_length,
-    )
-    seq_len = int(input_ids.shape[1])
-    m = int(image_length)
-    n = seq_len - m
-    rho = 1.0 - float(args.fastv_r) if args.use_fastv else 1.0
-    k = int(args.fastv_k) if args.use_fastv else 1
-    return {
-        "N": n,
-        "M": m,
-        "rho": rho,
-        "K": k,
-        "T": len(language_model.model.layers),
-        "d": int(text_config.hidden_size),
-        "ffn_dim": int(text_config.intermediate_size),
-        "visual_token_indices_shape": list(visual_indices.shape),
-    }
-
-
 def run_one_iteration(
     policy: Gr00tPolicy,
     args: argparse.Namespace,
@@ -199,10 +171,6 @@ def run_one_iteration(
         normalized_input = policy.apply_transforms(obs_copy)
         backbone_inputs, action_inputs = policy.model.prepare_input(normalized_input)
     preprocess_ms = timer.elapsed_ms
-
-    tflops_inputs = None
-    if measured and iteration == 0:
-        tflops_inputs = infer_tflops_inputs(policy, backbone_inputs, args)
 
     module_totals: dict[str, float] = {}
     eagle_model = policy.model.backbone.eagle_model
@@ -265,7 +233,7 @@ def run_one_iteration(
             f"e2e={end_to_end_latency_ms:.3f} ms",
             flush=True,
         )
-    return sample, tflops_inputs
+    return sample, None
 
 
 def summarize(df: pd.DataFrame) -> dict[str, dict[str, float]]:
@@ -359,27 +327,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         run_one_iteration(policy, args, i, measured=False)
 
     samples = []
-    tflops_inputs = None
     for i in range(args.repeat_steps):
-        sample, maybe_tflops_inputs = run_one_iteration(policy, args, i, measured=True)
+        sample, _ = run_one_iteration(policy, args, i, measured=True)
         samples.append(sample)
-        if maybe_tflops_inputs is not None:
-            tflops_inputs = maybe_tflops_inputs
 
     df = pd.DataFrame(samples)
-    tflops = {}
-    if tflops_inputs is not None:
-        tflops_args = {
-            key: tflops_inputs[key] for key in ("T", "K", "N", "M", "rho", "d", "ffn_dim")
-        }
-        tflops = estimate_transformer_tflops(**tflops_args)
-        df["theoretical_tflops"] = tflops["tflops_prune" if args.use_fastv else "tflops_full"]
-    else:
-        df["theoretical_tflops"] = None
-
-    df["effective_tflops_per_second"] = df["theoretical_tflops"] / (
-        df["model_latency_ms"] / 1000.0
-    )
     summary = summarize(df)
     baseline = load_baseline_summary(args.baseline_json)
     add_baseline_comparisons(df, summary, baseline)
@@ -399,8 +351,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "image_token_start_index": args.image_token_start_index,
             "image_token_length": args.image_token_length,
         },
-        "tflops_inputs": tflops_inputs,
-        "tflops": tflops,
         "summary": summary,
         "raw_measurements": samples,
         "output_csv": str(output_csv),
@@ -438,7 +388,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     result = run(args)
-    print(json.dumps({"summary": result["summary"], "tflops": result["tflops"]}, indent=2), flush=True)
+    print(json.dumps({"summary": result["summary"]}, indent=2), flush=True)
 
 
 if __name__ == "__main__":

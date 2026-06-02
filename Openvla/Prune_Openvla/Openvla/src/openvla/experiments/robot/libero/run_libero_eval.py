@@ -83,8 +83,6 @@ def _format_latency_summary(prefix: str, stats: dict) -> str:
 def _format_step_metrics(
     task_id: int, episode_idx: int, action_step: int, latency_ms: float, metrics: dict, warmup: bool = False
 ) -> str:
-    tflops = metrics.get("tflops")
-    og_tflops = metrics.get("og_tflops")
     prefix = "[metrics-warmup]" if warmup else "[metrics]"
     model_latency_ms = metrics.get("model_latency_ms", metrics.get("predict_latency_ms", latency_ms))
     data_ms = metrics.get("data_ms", 0.0)
@@ -102,12 +100,7 @@ def _format_step_metrics(
         f"data={_format_ms(data_ms)} preprocess={_format_ms(preprocess_ms)} vision={_format_ms(vision_ms)} "
         f"llm={_format_ms(llm_ms)} action={_format_ms(action_ms)}"
     )
-    if tflops is None:
-        return f"{prefix} task={task_id} episode={episode_idx} step={action_step} {latency_parts} | tflops=n/a"
-    return (
-        f"{prefix} task={task_id} episode={episode_idx} step={action_step} "
-        f"{latency_parts} | tflops={tflops:.4f} T | og_tflops={og_tflops:.4f} T"
-    )
+    return f"{prefix} task={task_id} episode={episode_idx} step={action_step} {latency_parts}"
 
 
 @dataclass

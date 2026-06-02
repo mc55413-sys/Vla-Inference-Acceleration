@@ -2,9 +2,6 @@
 .git
 .gitignore
 
-# Conda
-environment.yml
-
 # Artifacts
 checkpoints/
 rollouts/

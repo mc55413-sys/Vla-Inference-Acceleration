@@ -180,36 +180,6 @@ def infer_visual_token_indices(
     return torch.stack(visual_token_indices, dim=0), starts[0], int(counts[0].item()), contiguous
 
 
-def estimate_transformer_tflops(
-    T: int,
-    K: int,
-    N: int,
-    M: int,
-    rho: float,
-    d: int,
-    ffn_dim: int,
-) -> dict[str, float]:
-    mu = int(N) + int(M)
-    mu_tilde = int(N) + float(rho) * int(M)
-
-    def c(n):
-        return 4 * n * int(d) ** 2 + 2 * n**2 * int(d) + 2 * n * int(d) * int(ffn_dim)
-
-    flops_full = int(T) * c(mu)
-    flops_prune = (int(K) - 1) * c(mu) + (int(T) - int(K) + 1) * c(mu_tilde)
-    flops_ratio = flops_prune / flops_full if flops_full else 0.0
-    return {
-        "mu": mu,
-        "mu_tilde": mu_tilde,
-        "flops_full": flops_full,
-        "flops_prune": flops_prune,
-        "tflops_full": flops_full / 1e12,
-        "tflops_prune": flops_prune / 1e12,
-        "flops_ratio": flops_ratio,
-        "flops_reduction_percent": (1.0 - flops_ratio) * 100.0,
-    }
-
-
 def install_fastv_qwen3_forward(qwen3_model: torch.nn.Module) -> None:
     if getattr(qwen3_model, "_gr00t_fastv_forward_installed", False):
         return

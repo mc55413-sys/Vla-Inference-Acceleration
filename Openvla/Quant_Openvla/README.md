@@ -41,7 +41,11 @@ pip install "flash-attn==2.5.5" --no-build-isolation
 
 ## Usage
 
-All commands are run from the `openvla/` directory.
+All local commands are run from the `openvla/` source directory:
+
+```bash
+cd /path/to/Openvla/Quant_Openvla/openvla
+```
 
 ### 1. Profiling (One-Shot Comparison)
 
@@ -94,13 +98,13 @@ conda run --no-capture-output -n qvla-quant python -u experiments/robot/openvla_
 | `--device` | `cuda` / `cpu` | `cuda` |
 | `--profile_memory` | Whether to record peak GPU memory | `True` |
 | `--print_raw_measurements` | Print per-step raw latency measurements | `True` |
-| `--save_csv` | CSV output path for summary | `openvla/out/openvla_profile_summary.csv` |
-| `--save_json` | JSON output path for raw measurements | `openvla/out/openvla_profile_raw.json` |
+| `--save_csv` | CSV output path for summary | `out/openvla_profile_summary.csv` |
+| `--save_json` | JSON output path for raw measurements | `out/openvla_profile_raw.json` |
 
 **Output:**
 - Real-time per-iteration latency printed to terminal, plus a summary comparison table
 - If you run through `conda run`, keep `--no-capture-output` or `--live-stream`; otherwise conda may buffer stdout until the command exits.
-- CSV/JSON saved to `openvla/out/`
+- CSV/JSON saved to `out/`
 
 Latency notes:
 - `last_token_logits` is now **disabled by default**. Enable it to skip the unused full-vocabulary prefill projection. When enabled, the LLM still processes the full multimodal context and uses full-vocabulary argmax, but it no longer computes unused prefill logits for every context token.
@@ -218,6 +222,7 @@ action = model.predict_action(**inputs, do_sample=False)
 
 ```bash
 # Build image
+cd /path/to/Openvla/Quant_Openvla
 docker build -t qvla-quant .
 
 # Interactive run

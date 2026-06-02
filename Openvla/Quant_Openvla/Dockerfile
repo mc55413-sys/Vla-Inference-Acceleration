@@ -48,5 +48,8 @@ COPY openvla/ /workspace/openvla/
 RUN pip install -e openvla/ && \
     pip install -r openvla/requirements-min.txt pillow tqdm uvicorn fastapi json-numpy
 
+# README commands are written relative to the OpenVLA source directory.
+WORKDIR /workspace/openvla
+
 # Default command
 CMD ["/bin/bash"]

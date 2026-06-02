@@ -1,3 +1,0 @@
-model_name,quant_method,model_latency_speedup,end_to_end_latency_speedup,vision_latency_speedup,llm_latency_speedup,action_latency_speedup,peak_memory_reduction_percent,model_size_reduction_percent,effective_tflops_per_second,effective_tflops_per_second_improvement
-openvla-7b-finetuned-libero-spatial:fp16,fp16,1.0,1.0,1.0,1.0,1.0,0.0,0.0,13.383709550077068,1.0
-openvla-7b-finetuned-libero-spatial:bnb_int8,bitsandbytes-Linear8bitLt,0.6362194888254028,0.9821387836885549,0.9888843367076222,0.6213152950879032,1.0744153921229294,41.758492183268494,42.841952420646734,8.514976848537692,0.6362194888254027

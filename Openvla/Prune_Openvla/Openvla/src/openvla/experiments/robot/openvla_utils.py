@@ -46,78 +46,6 @@ def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
     return getattr(config, key, default)
 
 
-def _transformer_layer_flops(seq_len: int, hidden_size: int, intermediate_size: int) -> float:
-    return (
-        4 * seq_len * hidden_size * hidden_size
-        + 2 * seq_len * seq_len * hidden_size
-        + 2 * seq_len * hidden_size * intermediate_size
-    )
-
-
-def _estimate_vlapruner_tflops(cfg, vla, inputs: Dict[str, Any]) -> Dict[str, float]:
-    """Estimate Transformer TFLOPs using the VLA-Pruner/FastV sequence-length formula."""
-    language_model = getattr(vla, "language_model", None)
-    llm_config = getattr(language_model, "config", None)
-    text_config = _get_config_value(getattr(vla, "config", None), "text_config", None)
-
-    num_layers = _get_config_value(llm_config, "num_hidden_layers", _get_config_value(text_config, "num_hidden_layers"))
-    hidden_size = _get_config_value(llm_config, "hidden_size", _get_config_value(text_config, "hidden_size"))
-    intermediate_size = _get_config_value(
-        llm_config, "intermediate_size", _get_config_value(text_config, "intermediate_size")
-    )
-    if not all(value is not None for value in (num_layers, hidden_size, intermediate_size)):
-        return {}
-
-    input_ids = inputs.get("input_ids")
-    text_tokens = int(input_ids.shape[1]) if input_ids is not None else 0
-    if input_ids is not None and not torch.all(input_ids[:, -1] == 29871):
-        text_tokens += 1
-
-    visual_tokens = int(getattr(vla, "fastv_image_token_length", getattr(cfg, "fastv_image_token_length", 0)))
-    visual_start = int(getattr(vla, "fastv_image_token_start_index", getattr(cfg, "fastv_image_token_start_index", 1)))
-    full_seq_len = text_tokens + visual_tokens
-
-    pruning_info = getattr(language_model, "pruning_info", None)
-    if pruning_info is not None and pruning_info.get("original_seq_length") is not None:
-        full_seq_len = int(pruning_info["original_seq_length"])
-
-    kept_visual_tokens = visual_tokens
-    pruned_seq_len = full_seq_len
-    pruning_layer = None
-    if pruning_info is not None and pruning_info.get("kept_indices") is not None:
-        kept_indices = pruning_info["kept_indices"].detach().cpu()
-        visual_end = visual_start + visual_tokens
-        kept_visual_tokens = int(((kept_indices >= visual_start) & (kept_indices < visual_end)).sum().item())
-        pruned_seq_len = int(kept_indices.numel())
-        pruning_layer = pruning_info.get("pruning_layer")
-        if pruning_layer is not None:
-            pruning_layer = int(pruning_layer)
-
-    if pruning_layer is None:
-        full_layers = int(num_layers)
-        pruned_layers = 0
-    else:
-        # The local FastV/VLA-Pruner implementation prunes before this zero-based layer index.
-        full_layers = max(0, min(int(pruning_layer), int(num_layers)))
-        pruned_layers = int(num_layers) - full_layers
-
-    full_layer_flops = _transformer_layer_flops(full_seq_len, int(hidden_size), int(intermediate_size))
-    pruned_layer_flops = _transformer_layer_flops(pruned_seq_len, int(hidden_size), int(intermediate_size))
-    og_flops = int(num_layers) * full_layer_flops
-    pruned_flops = full_layers * full_layer_flops + pruned_layers * pruned_layer_flops
-
-    return {
-        "tflops": pruned_flops / 1e12,
-        "og_tflops": og_flops / 1e12,
-        "flops_ratio": pruned_flops / og_flops if og_flops else 1.0,
-        "full_seq_len": float(full_seq_len),
-        "pruned_seq_len": float(pruned_seq_len),
-        "visual_tokens": float(visual_tokens),
-        "kept_visual_tokens": float(kept_visual_tokens),
-        "rho": kept_visual_tokens / visual_tokens if visual_tokens else 1.0,
-    }
-
-
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Checks whether a model path points to a model on Hugging Face Hub."""
     # If the API call below runs without error, the model is on the hub
@@ -551,7 +479,7 @@ def get_vla_action(cfg, vla, processor, base_vla_name, obs, task_label, unnorm_k
         torch.cuda.synchronize()
     time_elapsed = time.perf_counter() - start_time
     model_latency_ms = time_elapsed * 1000.0
-    metrics = _estimate_vlapruner_tflops(cfg, vla, inputs)
+    metrics = {}
     breakdown = dict(getattr(vla, "_latency_breakdown", {}) or {})
     breakdown["preprocess_ms"] = preprocess_ms
 

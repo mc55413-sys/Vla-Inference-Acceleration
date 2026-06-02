@@ -30,8 +30,23 @@ checkpoints/
 results/
 logs/
 outputs/
+out/
 runs/
 wandb/
+rollouts/
+rollouts_dev/
+gr00t_cache_results/
+duquant*/
+*.log
+*.mp4
+*.nsys-rep
+*.qdrep
+*.sqlite
+*_report*.txt
+*_REPORT*.txt
+EXPERIMENT_REPORT.txt
+CONSOLIDATED_EXPERIMENT_REPORT.txt
+report_for_advisor.txt
 
 # System/editor files
 .DS_Store

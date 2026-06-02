@@ -382,25 +382,6 @@ def format_realtime_dual_system_latency_line(
     )
 
 
-def format_realtime_tflops_line(
-    task_id,
-    episode_idx,
-    step,
-    step_timing,
-    latency_values,
-    dense_equiv_tflops_per_get_action,
-):
-    if dense_equiv_tflops_per_get_action is None:
-        return None
-    parts = [
-        f"dense_equiv={float(dense_equiv_tflops_per_get_action):.4f}TFLOPs/call",
-    ]
-    return (
-        f"[tflops] task={task_id} episode={episode_idx} step={step} "
-        + " | ".join(part for part in parts if part)
-    )
-
-
 def format_gib_from_step_memory(step_memory, key):
     value = step_memory.get(key)
     if value is None:
@@ -488,8 +469,6 @@ class GenerateConfig:
     print_step_latency: bool = False
     """Print verbose per-step timing internals for debugging."""
     print_detailed_step_latency: bool = False
-    """Dense-equivalent TFLOPs per get_action; used for live TFLOPs/call logs."""
-    dense_equiv_tflops_per_get_action: float | None = None
 
 
 class GR00TPolicy:
@@ -769,16 +748,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
                                 ),
                                 log_file,
                             )
-                            tflops_line = format_realtime_tflops_line(
-                                task_id,
-                                episode_idx,
-                                t,
-                                step_timing,
-                                latency_values,
-                                cfg.dense_equiv_tflops_per_get_action,
-                            )
-                            if tflops_line:
-                                print_and_log(tflops_line, log_file)
                             if cfg.print_detailed_step_latency:
                                 if step_memory:
                                     print_and_log(
