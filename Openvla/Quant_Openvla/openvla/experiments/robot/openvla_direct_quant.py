@@ -16,7 +16,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-_SUPPORTED_MODES = {"none", "fp16", "bf16", "w8a16", "int8", "w8a8", "int8_dynamic", "w4a16", "int4"}
+_SUPPORTED_MODES = {
+    "none",
+    "fp16",
+    "bf16",
+    "w8a16",
+    "int8",
+    "w8a8",
+    "int8_dynamic",
+    "w4a16",
+    "int4",
+    "fp8",
+    "fp8_tensorwise",
+    "w4a8",
+    "bnb_int8",
+    "bnb_nf4",
+    "bnb_fp4",
+}
 
 
 @dataclass
@@ -27,17 +43,38 @@ class DirectQuantConfig:
     group_size: int = 128
     min_linear_weight_numel: int = 0
     target: str = "llm"
+    bnb_int8_threshold: float = 0.0
+    bnb_4bit_compute_dtype: str = "auto"
+    bnb_4bit_quant_type: str = "nf4"
+    bnb_4bit_use_double_quant: bool = True
+    fp8_activation_scale: float = 1.0
     skip_module_name_substrings: Tuple[str, ...] = field(
         default_factory=lambda: ("lm_head", "embed", "norm", "rotary")
     )
 
     def normalized_mode(self) -> str:
         mode = self.mode.lower().replace("-", "_")
+        if mode in {"bnb_4bit", "bnb_int4", "bitsandbytes_4bit"}:
+            quant_type = self.bnb_4bit_quant_type.lower()
+            if quant_type not in {"nf4", "fp4"}:
+                raise ValueError(f"Unsupported bitsandbytes 4-bit quantization type: {self.bnb_4bit_quant_type}")
+            return f"bnb_{quant_type}"
         aliases = {
             "int8": "w8a16",
             "int8_dynamic": "w8a8",
             "int4": "w4a16",
             "w8a8_dynamic": "w8a8",
+            "w8a8_fp8": "fp8",
+            "fp8_tensorwise": "fp8",
+            "w4a8": "fp8",
+            "bnb_8bit": "bnb_int8",
+            "bitsandbytes_8bit": "bnb_int8",
+            "bitsandbytes_int8": "bnb_int8",
+            "llm_int8": "bnb_int8",
+            "bitsandbytes_nf4": "bnb_nf4",
+            "nf4": "bnb_nf4",
+            "fp4": "bnb_fp4",
+            "bitsandbytes_fp4": "bnb_fp4",
         }
         mode = aliases.get(mode, mode)
         if mode not in _SUPPORTED_MODES:
@@ -290,6 +327,96 @@ class WeightOnlyInt4Linear(nn.Module):
         )
 
 
+class FP8TensorwiseLinear(nn.Module):
+    """Tensor-wise FP8 Linear using ``torch._scaled_mm`` on CUDA.
+
+    This is a latency-oriented path for GPUs with FP8 tensor cores. It keeps the
+    weight in FP8 and dynamically casts activations to FP8 without changing the
+    sequence length or model depth.
+    """
+
+    quant_backend = "direct-fp8-tensorwise-scaled-mm"
+    weight_bits = 8
+    activation_bits = 8
+
+    def __init__(
+        self,
+        qweight_t: torch.Tensor,
+        weight_scale: torch.Tensor,
+        activation_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        in_features: int,
+        out_features: int,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("qweight_t", qweight_t.contiguous())
+        self.register_buffer("weight_scale", weight_scale.reshape(()).contiguous())
+        self.register_buffer("activation_scale", activation_scale.reshape(()).contiguous())
+        self._activation_scale_is_one = float(activation_scale.detach().cpu()) == 1.0
+        if bias is not None:
+            self.register_buffer("bias", bias.contiguous())
+        else:
+            self.bias = None
+
+    @classmethod
+    @torch.no_grad()
+    def from_linear(cls, linear: nn.Linear, activation_scale: float = 1.0) -> "FP8TensorwiseLinear":
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("FP8 quantization requires a PyTorch build with torch.float8_e4m3fn")
+
+        weight = linear.weight.detach()
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scale = weight.float().abs().amax().clamp(min=1.0e-8) / fp8_max
+        qweight = torch.clamp(weight.float() / scale, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        bias = linear.bias.detach().clone() if linear.bias is not None else None
+        return cls(
+            qweight.t().contiguous(),
+            scale.to(dtype=torch.float32, device=weight.device),
+            torch.tensor(float(activation_scale), dtype=torch.float32, device=weight.device),
+            bias,
+            linear.in_features,
+            linear.out_features,
+        )
+
+    def _dequantized_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        compute_dtype = input_tensor.dtype if input_tensor.is_cuda else torch.float32
+        weight = self.qweight_t.t().to(dtype=compute_dtype) * self.weight_scale.to(dtype=compute_dtype)
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(dtype=compute_dtype)
+        linear_input = input_tensor if input_tensor.dtype == compute_dtype else input_tensor.to(compute_dtype)
+        output = F.linear(linear_input, weight, bias)
+        return output if output.dtype == input_tensor.dtype else output.to(input_tensor.dtype)
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        if not (input_tensor.is_cuda and hasattr(torch, "_scaled_mm") and hasattr(torch, "float8_e4m3fn")):
+            return self._dequantized_forward(input_tensor)
+
+        original_shape = input_tensor.shape[:-1]
+        compute_dtype = input_tensor.dtype if input_tensor.dtype in {torch.float16, torch.bfloat16} else torch.bfloat16
+        x_2d = input_tensor.reshape(-1, self.in_features)
+        if self._activation_scale_is_one:
+            x_q = x_2d.to(torch.float8_e4m3fn).contiguous()
+        else:
+            x_q = (x_2d.float() / self.activation_scale).to(torch.float8_e4m3fn).contiguous()
+
+        out = torch._scaled_mm(
+            x_q,
+            self.qweight_t,
+            scale_a=self.activation_scale,
+            scale_b=self.weight_scale,
+            out_dtype=compute_dtype,
+        )
+        if self.bias is not None:
+            out = out + self.bias.to(dtype=compute_dtype)[None, :]
+        return out.reshape(*original_shape, self.out_features).to(dtype=input_tensor.dtype)
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
+
+
 def quantize_openvla_language_model(model: nn.Module, config: DirectQuantConfig) -> QuantizationReport:
     """Replace Linear layers in ``model.language_model`` with direct quantized modules."""
 
@@ -414,6 +541,13 @@ def _make_quantized_linear(linear: nn.Linear, mode: str, config: DirectQuantConf
         return DynamicInt8Linear.from_linear(linear)
     if mode == "w4a16":
         return WeightOnlyInt4Linear.from_linear(linear, group_size=config.group_size)
+    if mode == "fp8":
+        return FP8TensorwiseLinear.from_linear(linear, activation_scale=config.fp8_activation_scale)
+    if mode == "bnb_int8":
+        return _make_bnb_int8_linear(linear, config)
+    if mode in {"bnb_nf4", "bnb_fp4"}:
+        quant_type = "nf4" if mode == "bnb_nf4" else "fp4"
+        return _make_bnb_4bit_linear(linear, config, quant_type=quant_type)
     raise ValueError(f"Unsupported normalized quantization mode: {mode}")
 
 
@@ -424,7 +558,71 @@ def _backend_name_for_mode(mode: str) -> str:
         return DynamicInt8Linear.quant_backend
     if mode == "w4a16":
         return WeightOnlyInt4Linear.quant_backend
+    if mode == "fp8":
+        return FP8TensorwiseLinear.quant_backend
+    if mode == "bnb_int8":
+        return "bitsandbytes-Linear8bitLt"
+    if mode == "bnb_nf4":
+        return "bitsandbytes-Linear4bit-nf4"
+    if mode == "bnb_fp4":
+        return "bitsandbytes-Linear4bit-fp4"
     return "none"
+
+
+def _make_bnb_int8_linear(linear: nn.Linear, config: DirectQuantConfig) -> nn.Module:
+    bnb = _import_bitsandbytes()
+    quantized = bnb.nn.Linear8bitLt(
+        linear.in_features,
+        linear.out_features,
+        bias=linear.bias is not None,
+        has_fp16_weights=False,
+        threshold=config.bnb_int8_threshold,
+        device=linear.weight.device,
+    )
+    quantized.load_state_dict(linear.state_dict(), strict=True)
+    quantized.requires_grad_(False)
+    return quantized
+
+
+def _make_bnb_4bit_linear(linear: nn.Linear, config: DirectQuantConfig, quant_type: str) -> nn.Module:
+    bnb = _import_bitsandbytes()
+    compute_dtype = _resolve_bnb_compute_dtype(config.bnb_4bit_compute_dtype, linear.weight.dtype)
+    quantized = bnb.nn.Linear4bit(
+        linear.in_features,
+        linear.out_features,
+        bias=linear.bias is not None,
+        compute_dtype=compute_dtype,
+        compress_statistics=config.bnb_4bit_use_double_quant,
+        quant_type=quant_type,
+        device=linear.weight.device,
+    )
+    quantized.load_state_dict(linear.state_dict(), strict=True)
+    quantized.requires_grad_(False)
+    return quantized
+
+
+def _import_bitsandbytes():
+    try:
+        import bitsandbytes as bnb
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "bitsandbytes is required for bnb_int8/bnb_nf4/bnb_fp4 modes. "
+            "Install it with `pip install bitsandbytes` in the OpenVLA environment."
+        ) from exc
+    return bnb
+
+
+def _resolve_bnb_compute_dtype(value: str, fallback: torch.dtype) -> torch.dtype:
+    normalized = str(value).lower()
+    if normalized == "auto":
+        return fallback if fallback in {torch.float16, torch.bfloat16} else torch.bfloat16
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16"}:
+        return torch.float16
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    raise ValueError(f"Unsupported bitsandbytes 4-bit compute dtype: {value}")
 
 
 def _iter_parameters_and_buffers(module: nn.Module) -> Iterable[torch.Tensor]:

@@ -50,6 +50,26 @@ quantvla_select_task() {
   esac
 }
 
+quantvla_default_denoising_steps() {
+  case "${QVLA_VARIANT:-}" in
+    baseline_bf16_sdpa)
+      echo 8
+      ;;
+    duquant_w4_packed|quantvla_full_w4_packed|fp8_selective)
+      echo 8
+      ;;
+    *)
+      echo 8
+      ;;
+  esac
+}
+
+quantvla_resolve_denoising_steps() {
+  local default_steps
+  default_steps="$(quantvla_default_denoising_steps)"
+  echo "${QVLA_DENOISING_STEPS:-$default_steps}"
+}
+
 quantvla_use_baseline() {
   local task="${1:-${QVLA_TASK:-libero_10}}"
   quantvla_clear_quant_env
@@ -57,7 +77,9 @@ quantvla_use_baseline() {
   export QVLA_VARIANT="baseline_bf16_sdpa"
   export GR00T_ATTN_IMPLEMENTATION="${GR00T_ATTN_IMPLEMENTATION:-sdpa}"
   export NO_ALBUMENTATIONS_UPDATE=1
-  echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK model=$QVLA_MODEL_PATH"
+  export GR00T_TORCH_COMPILE="${GR00T_TORCH_COMPILE:-1}"
+  export GR00T_TORCH_COMPILE_MODE="${GR00T_TORCH_COMPILE_MODE:-default}"
+  echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK model=$QVLA_MODEL_PATH compile=$GR00T_TORCH_COMPILE"
 }
 
 quantvla_use_duquant() {
@@ -65,20 +87,22 @@ quantvla_use_duquant() {
   quantvla_use_baseline "$task" || return 1
   export QVLA_VARIANT="duquant_w4_packed"
   export GR00T_DUQUANT_SCOPE=""
-  export GR00T_DUQUANT_INCLUDE='.*(backbone\.eagle_model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)|action_head\.model\.transformer_blocks\.\d+\.ff\.net\.(0\.proj|2)).*'
+  export GR00T_DUQUANT_INCLUDE='.*backbone\.eagle_model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj).*'
   export GR00T_DUQUANT_EXCLUDE='(?:^|\.)(vision|radio|norm|ln|layernorm|embed|lm_head|attn1)(?:\.|$)'
   export GR00T_DUQUANT_WBITS_DEFAULT=4
   export GR00T_DUQUANT_ABITS=0
   export GR00T_DUQUANT_BLOCK=64
-  export GR00T_DUQUANT_PERMUTE=0
-  export GR00T_DUQUANT_ROW_ROT=restore
+  export GR00T_DUQUANT_PERMUTE=1
+  export GR00T_DUQUANT_ROW_ROT=propagate
   export GR00T_DUQUANT_ACT_PCT=99.9
   export GR00T_DUQUANT_CALIB_STEPS=32
   export GR00T_DUQUANT_LS=0.15
   export GR00T_DUQUANT_STORAGE=packed
   export GR00T_DUQUANT_ACT_MODE=off
   export GR00T_DUQUANT_PACKDIR="$QUANTVLA_ROOT/results/duquant_pack/${QVLA_TASK}"
-  echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK packdir=$GR00T_DUQUANT_PACKDIR"
+  export GR00T_TORCH_COMPILE="${GR00T_TORCH_COMPILE:-1}"
+  export GR00T_TORCH_COMPILE_MODE="${GR00T_TORCH_COMPILE_MODE:-default}"
+  echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK packdir=$GR00T_DUQUANT_PACKDIR compile=$GR00T_TORCH_COMPILE"
 }
 
 quantvla_use_full() {
@@ -92,4 +116,16 @@ quantvla_use_full() {
   export GR00T_OHB_SCOPE="${GR00T_OHB_SCOPE:-dit}"
   export GR00T_OHB_FALLBACK="${GR00T_OHB_FALLBACK:-1.0}"
   echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK alpha=$GR00T_ATM_ALPHA_PATH"
+}
+
+quantvla_use_fp8() {
+  local task="${1:-${QVLA_TASK:-libero_10}}"
+  quantvla_use_baseline "$task" || return 1
+  export QVLA_VARIANT="fp8_selective"
+  # Enable selective FP8 for large LLM matmuls (gate/up/down proj)
+  export GR00T_FP8_MODE=1
+  # Enable torch.compile with CUDA graphs for kernel fusion
+  export GR00T_TORCH_COMPILE="${GR00T_TORCH_COMPILE:-1}"
+  export GR00T_TORCH_COMPILE_MODE="${GR00T_TORCH_COMPILE_MODE:-default}"
+  echo "[QuantVLA] variant=$QVLA_VARIANT task=$QVLA_TASK torch_compile=$GR00T_TORCH_COMPILE compile_mode=$GR00T_TORCH_COMPILE_MODE"
 }

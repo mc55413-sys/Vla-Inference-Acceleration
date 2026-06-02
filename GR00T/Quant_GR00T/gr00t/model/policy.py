@@ -610,22 +610,74 @@ class Gr00tPolicy(BasePolicy):
         except Exception as e:
             print(f"[GR00T] Failed to patch attention for ATM support: {e}")
 
-        # Apply DuQuant W4A8 quantization if configured via environment variables
-        # This must be done BEFORE moving model to device
-        # IMPORTANT: This is called AFTER action_head recreation to ensure DiT layers are quantized
-        try:
-            from gr00t.quantization import enable_duquant_if_configured
-            enable_duquant_if_configured(model)
-        except Exception as e:
-            print(f"[GR00T] DuQuant not enabled or failed to apply: {e}")
+        # Apply selective FP8 Linear conversion for large LLM matmuls
+        # (gate/up/down proj) when GR00T_FP8_MODE=1 — replaces DuQuant/ATM.
+        if os.environ.get("GR00T_FP8_MODE", "0") == "1":
+            from gr00t.quantization.fp8_linear import convert_to_fp8_linear
+            print("[GR00T] Selective FP8 mode: converting large LLM matmuls to FP8...")
+            n_fp8 = convert_to_fp8_linear(model, verbose=True)
+            print(f"[GR00T] FP8 conversion done: {n_fp8} layers converted")
+        else:
+            # Apply DuQuant W4A8 quantization if configured via environment variables
+            # This must be done BEFORE moving model to device
+            # IMPORTANT: This is called AFTER action_head recreation to ensure DiT layers are quantized
+            try:
+                from gr00t.quantization import enable_duquant_if_configured
+                enable_duquant_if_configured(model)
+            except Exception as e:
+                print(f"[GR00T] DuQuant not enabled or failed to apply: {e}")
 
-        # Apply ATM scaling if configured (uses pre-loaded alpha JSON)
-        try:
-            enable_dit_atm_if_configured(model)
-        except Exception as e:
-            print(f"[GR00T] ATM not enabled or failed to apply: {e}")
+            # Apply ATM scaling if configured (uses pre-loaded alpha JSON)
+            try:
+                enable_dit_atm_if_configured(model)
+            except Exception as e:
+                print(f"[GR00T] ATM not enabled or failed to apply: {e}")
 
         model.to(device=self.device)  # type: ignore
+
+        # torch.compile strategy (GR00T_TORCH_COMPILE=1):
+        #   DiT (action_head): max-autotune + CUDA graphs — fixed shapes → 1.45x
+        #   LLM (backbone):    default mode — BUT skip if DuQuant is active
+        #                      (DuQuant custom layers cause graph breaks)
+        if os.environ.get("GR00T_TORCH_COMPILE", "0") == "1":
+            import torch
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.enable_flash_sdp(True)
+
+            # DiT action_head: always safe to compile (BF16, fixed shapes)
+            if hasattr(model, 'action_head') and model.action_head is not None:
+                try:
+                    model.action_head = torch.compile(
+                        model.action_head, mode="max-autotune"
+                    )
+                    print("[GR00T]   action_head (DiT): max-autotune + CUDA graphs")
+                except Exception as e:
+                    print(f"[GR00T]   action_head compile failed: {e}")
+
+            # LLM backbone: compile by default even with DuQuant. The custom
+            # layers may graph-break, but the surrounding Eagle blocks still
+            # benefit on Blackwell/Ada GPUs; keep an env kill switch for
+            # machines where this is unstable.
+            if hasattr(model, 'backbone') and model.backbone is not None:
+                duquant_active = os.environ.get("GR00T_DUQUANT_WBITS_DEFAULT", "").strip() not in ("", "0")
+                compile_duquant_backbone = os.environ.get(
+                    "GR00T_DUQUANT_COMPILE_BACKBONE", "1"
+                ) not in ("0", "false", "False")
+                if duquant_active and not compile_duquant_backbone:
+                    print("[GR00T]   backbone: SKIP compile (DuQuant custom layers active)")
+                else:
+                    try:
+                        model.backbone = torch.compile(
+                            model.backbone, mode="default"
+                        )
+                        if duquant_active:
+                            print("[GR00T]   backbone (DuQuant LLM): default")
+                        else:
+                            print("[GR00T]   backbone (LLM): default")
+                    except Exception as e:
+                        print(f"[GR00T]   backbone compile failed: {e}")
+
+            print("[GR00T] torch.compile applied successfully")
 
         self.model = model
 

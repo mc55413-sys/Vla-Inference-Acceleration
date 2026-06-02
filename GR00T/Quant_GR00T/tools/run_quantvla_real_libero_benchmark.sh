@@ -12,7 +12,6 @@ else
 fi
 EXTRA_EVAL_ARGS=("$@")
 
-DENOISING_STEPS="${QVLA_DENOISING_STEPS:-8}"
 PRIMARY_LATENCY_KEY="${QVLA_PRIMARY_LATENCY_KEY:-dual_stage_sum_ms}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,13 +30,17 @@ case "$VARIANT" in
   full|quantvla_full|quantvla_full_w4_packed)
     quantvla_use_full "$TASK"
     ;;
+  fp8|fp8_selective)
+    quantvla_use_fp8 "$TASK"
+    ;;
   *)
     echo "Unknown variant: $VARIANT" >&2
-    echo "Use one of: baseline, duquant, full" >&2
+    echo "Use one of: baseline, duquant, full, fp8" >&2
     exit 1
     ;;
 esac
 
+DENOISING_STEPS="$(quantvla_resolve_denoising_steps)"
 OUT_DIR="$OUT_ROOT/$QVLA_VARIANT/$QVLA_TASK"
 mkdir -p "$OUT_DIR"
 METRICS_LOG="/tmp/logs/libero_eval_${QVLA_VARIANT}_${QVLA_TASK}.log"

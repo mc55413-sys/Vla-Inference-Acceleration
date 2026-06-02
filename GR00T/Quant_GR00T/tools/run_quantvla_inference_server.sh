@@ -19,14 +19,17 @@ case "$VARIANT" in
   full|quantvla_full|quantvla_full_w4_packed)
     quantvla_use_full "$TASK"
     ;;
+  fp8|fp8_selective)
+    quantvla_use_fp8 "$TASK"
+    ;;
   *)
     echo "Unknown variant: $VARIANT" >&2
-    echo "Use one of: baseline, duquant, full" >&2
+    echo "Use one of: baseline, duquant, full, fp8" >&2
     exit 1
     ;;
 esac
 
-export GR00T_DENOISING_STEPS="${QVLA_DENOISING_STEPS:-8}"
+export GR00T_DENOISING_STEPS="$(quantvla_resolve_denoising_steps)"
 python tools/check_cuda_available.py --context "QuantVLA inference server"
 
 echo "[QuantVLA] Starting real inference server"

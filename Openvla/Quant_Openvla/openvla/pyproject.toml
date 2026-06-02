@@ -54,6 +54,9 @@ profiling = [
     "pandas>=2.0.0",
     "matplotlib",
 ]
+quant = [
+    "bitsandbytes>=0.43.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

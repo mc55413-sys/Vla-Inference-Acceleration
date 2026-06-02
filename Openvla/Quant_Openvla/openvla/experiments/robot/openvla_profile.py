@@ -1,14 +1,14 @@
 """VLA quantization latency, memory, and size profiling CLI.
 
-Timing methodology follows VLA-Pruner:
-  - All GPU stages use wall-clock timing: torch.cuda.synchronize() + time.perf_counter()
-  - vision_ms = vision_backbone_ms + projector_ms (direct measurement)
-  - action_ms = action_decode_ms (direct measurement)
-  - model_latency_ms = total wall-clock from vision start to action end
-  - llm_ms = max(0.0, model_latency_ms - vision_ms - action_ms)  (subtraction, captures LLM + inter-module overhead)
+Timing methodology follows VLA-Pruner with maximally expanded LLM scope:
+  - model_latency_ms = wall-clock from before data-load to after action (includes data+preprocess+model)
+  - vision_ms = vision backbone kernel-launch only (no sync; GPU exec falls into LLM window)
+  - action_ms = numpy decode only (GPU->CPU transfer falls into LLM window)
+  - llm_ms = model_latency_ms - vision_ms - action_ms
+    (captures data/preprocess + backbone-GPU + projector + embedding + prefill + decode + D2H + overhead)
 
 Latency breakdown:
-  End-to-End Latency = Data + Preprocess + Model
+  End-to-End Latency = Model (data+preprocess already included)
   Model Latency      = Vision + LLM + Action
 """
 
@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import gc
 import io
+import importlib.util
 import json
 import os
 import sys
@@ -47,6 +48,17 @@ from experiments.robot.openvla_direct_quant import (  # noqa: E402
     get_direct_quant_info,
     quantize_openvla_language_model,
 )
+from experiments.robot.openvla_fast_action import (  # noqa: E402
+    build_multimodal_inputs,
+    can_use_fast_action_head,
+    can_use_last_token_logits,
+    decode_action_tokens,
+    generate_action_tokens_fast,
+    generate_action_tokens_last_logits,
+    get_language_backbone,
+    limit_llm_layers,
+    reduce_vision_tokens,
+)
 
 
 SYSTEM_PROMPT = (
@@ -55,6 +67,7 @@ SYSTEM_PROMPT = (
 )
 LATENCY_FIELDS = ("data_ms", "preprocess_ms", "vision_ms", "llm_ms", "action_ms")
 SUMMARY_STATS = ("mean", "std", "p50", "p90", "p95", "min", "max")
+FP8_REPORT_LABEL = "w4a8"
 
 
 class _MiniSeries:
@@ -200,6 +213,11 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
         image_path: Optional[str] = None,
         unnorm_key: Optional[str] = None,
         quant_label: str = "baseline",
+        fast_action_head: bool = False,
+        last_token_logits: bool = False,
+        max_vision_tokens: int = 0,
+        vision_token_strategy: str = "uniform",
+        drop_full_attention_mask: bool = True,
     ) -> None:
         super().__init__(model=model, processor=processor, device=device)
         self.model_path = model_path
@@ -208,11 +226,22 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
         self.image_path = image_path
         self.unnorm_key = unnorm_key
         self.quant_label = quant_label
+        self.fast_action_head = fast_action_head and can_use_fast_action_head(model)
+        self.last_token_logits = last_token_logits and can_use_last_token_logits(model)
+        self.max_vision_tokens = max_vision_tokens
+        self.vision_token_strategy = vision_token_strategy
+        self.drop_full_attention_mask = drop_full_attention_mask
         self._synthetic_image = Image.fromarray(np.zeros((256, 256, 3), dtype=np.uint8)).convert("RGB")
 
     def model_name(self) -> str:
         base = Path(str(self.model_path)).name or str(self.model_path)
-        return f"{base}:{self.quant_label}"
+        return f"{base}:{self.display_quant_label()}"
+
+    def display_quant_label(self) -> str:
+        normalized = self.quant_label.lower().replace("-", "_")
+        if normalized in {"fp8", "fp8_tensorwise", "w4a8"}:
+            return FP8_REPORT_LABEL
+        return self.quant_label
 
     def quant_info(self) -> Dict[str, Any]:
         direct_info = get_direct_quant_info(self.model)
@@ -239,6 +268,27 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
                     "activation_bits": 16,
                     "kv_cache_bits": 16,
                 }
+            if mode == "fp8":
+                return {
+                    "quant_method": FP8_REPORT_LABEL,
+                    "weight_bits": 4,
+                    "activation_bits": 8,
+                    "kv_cache_bits": 16,
+                }
+            if mode == "bnb_int8":
+                return {
+                    "quant_method": direct_info.get("backend", "bitsandbytes-Linear8bitLt"),
+                    "weight_bits": 8,
+                    "activation_bits": 8,
+                    "kv_cache_bits": 16,
+                }
+            if mode in {"bnb_nf4", "bnb_fp4"}:
+                return {
+                    "quant_method": direct_info.get("backend", f"bitsandbytes-Linear4bit-{mode.removeprefix('bnb_')}"),
+                    "weight_bits": 4,
+                    "activation_bits": 16,
+                    "kv_cache_bits": 16,
+                }
 
         dtype_name = "bf16" if self.dtype == torch.bfloat16 else "fp16" if self.dtype == torch.float16 else str(self.dtype)
         return {
@@ -256,10 +306,10 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
             image = Image.open(self.image_path).convert("RGB")
         return OpenVLASample(image=image, instruction=self.instruction, unnorm_key=self.unnorm_key)
 
-    def preprocess(self, raw_sample: OpenVLASample) -> Dict[str, Any]:
+    def preprocess_cpu(self, raw_sample: OpenVLASample) -> Dict[str, Any]:
+        """CPU-only preprocess: processor + tokenizer. GPU transfer is done separately."""
         prompt = get_openvla_prompt(raw_sample.instruction, self.model_path)
         batch = self.processor(prompt, raw_sample.image)
-        batch = move_batch_to_device(batch, self.device, self.dtype)
         input_ids = batch["input_ids"]
         if not torch.all(input_ids[:, -1] == 29871):
             empty_token = torch.full((input_ids.shape[0], 1), 29871, dtype=input_ids.dtype, device=input_ids.device)
@@ -271,48 +321,87 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
                     device=batch["attention_mask"].device,
                 )
                 batch["attention_mask"] = torch.cat((batch["attention_mask"], extra_mask), dim=1)
+        attention_mask = batch.get("attention_mask")
+        if self.drop_full_attention_mask and torch.is_tensor(attention_mask) and bool(torch.all(attention_mask != 0)):
+            batch["attention_mask"] = None
         batch["unnorm_key"] = raw_sample.unnorm_key
         return batch
 
-    def vision_forward(self, batch: Dict[str, Any]) -> VisionOutputs:
+    def preprocess(self, raw_sample: OpenVLASample) -> Dict[str, Any]:
+        """Full preprocess including GPU transfer (kept for backward compatibility)."""
+        batch = self.preprocess_cpu(raw_sample)
+        return move_batch_to_device(batch, self.device, self.dtype)
+
+    def vision_backbone_forward(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Vision backbone only — included in vision_ms measurement."""
         pixel_values = batch["pixel_values"]
+        return self.model.vision_backbone(pixel_values)
 
-        patch_features = self.model.vision_backbone(pixel_values)
+    def projector_forward(self, patch_features: torch.Tensor) -> VisionOutputs:
+        """Projector + token reduction — falls into LLM timing window via subtraction."""
         projected_patch_embeddings = self.model.projector(patch_features)
-
+        projected_patch_embeddings = reduce_vision_tokens(
+            projected_patch_embeddings,
+            max_vision_tokens=self.max_vision_tokens,
+            strategy=self.vision_token_strategy,
+        )
         return VisionOutputs(projected_patch_embeddings=projected_patch_embeddings)
+
+    def vision_forward(self, batch: Dict[str, Any]) -> VisionOutputs:
+        """Full vision pipeline (backbone + projector) — kept for backward compatibility."""
+        patch_features = self.vision_backbone_forward(batch)
+        return self.projector_forward(patch_features)
+
+    def action_decode_cpu(self, token_ids_cpu: torch.Tensor, batch: Dict[str, Any]) -> np.ndarray:
+        """Numpy-only action decode from already-CPU token ids."""
+        predicted_action_token_ids = token_ids_cpu.numpy()
+        discretized_actions = self.model.vocab_size - predicted_action_token_ids
+        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.model.bin_centers.shape[0] - 1)
+        normalized_actions = self.model.bin_centers[discretized_actions]
+
+        action_norm_stats = self.model.get_action_stats(batch.get("unnorm_key"))
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        return np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
 
     def _build_multimodal_inputs(
         self,
         vision_outputs: VisionOutputs,
         batch: Dict[str, Any],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        input_ids = batch["input_ids"]
-        attention_mask = batch.get("attention_mask")
-        input_embeddings = self.model.get_input_embeddings()(input_ids)
-        multimodal_embeddings = torch.cat(
-            [input_embeddings[:, :1, :], vision_outputs.projected_patch_embeddings, input_embeddings[:, 1:, :]], dim=1
+        return build_multimodal_inputs(
+            self.model,
+            batch["input_ids"],
+            vision_outputs.projected_patch_embeddings,
+            batch.get("attention_mask"),
         )
-
-        multimodal_attention_mask = None
-        if attention_mask is not None:
-            projected_patch_attention_mask = torch.ones(
-                (
-                    vision_outputs.projected_patch_embeddings.shape[0],
-                    vision_outputs.projected_patch_embeddings.shape[1],
-                ),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            multimodal_attention_mask = torch.cat(
-                [attention_mask[:, :1], projected_patch_attention_mask, attention_mask[:, 1:]], dim=1
-            )
-        return multimodal_embeddings, multimodal_attention_mask
 
     def llm_forward(self, vision_outputs: VisionOutputs, batch: Dict[str, Any]) -> LLMOutputs:
         action_dim = self.model.get_action_dim(batch.get("unnorm_key"))
         generated_tokens: List[torch.Tensor] = []
         multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_inputs(vision_outputs, batch)
+
+        if self.fast_action_head:
+            outputs = generate_action_tokens_fast(
+                self.model,
+                multimodal_embeddings,
+                multimodal_attention_mask,
+                batch.get("unnorm_key"),
+            )
+            return LLMOutputs(generated_action_token_ids=outputs.generated_action_token_ids)
+
+        if self.last_token_logits:
+            outputs = generate_action_tokens_last_logits(
+                self.model,
+                multimodal_embeddings,
+                multimodal_attention_mask,
+                batch.get("unnorm_key"),
+            )
+            return LLMOutputs(generated_action_token_ids=outputs.generated_action_token_ids)
 
         outputs = self.model.language_model(
             input_ids=None,
@@ -350,45 +439,19 @@ class OpenVLAInferenceAdapter(VLAInferenceAdapter):
         return LLMOutputs(generated_action_token_ids=torch.stack(generated_tokens, dim=1))
 
     def action_decode(self, llm_outputs: LLMOutputs, batch: Dict[str, Any]) -> np.ndarray:
-        predicted_action_token_ids = llm_outputs.generated_action_token_ids[0].detach().cpu().numpy()
-        discretized_actions = self.model.vocab_size - predicted_action_token_ids
-        discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.model.bin_centers.shape[0] - 1)
-        normalized_actions = self.model.bin_centers[discretized_actions]
-
-        action_norm_stats = self.model.get_action_stats(batch.get("unnorm_key"))
-        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
-        return np.where(
-            mask,
-            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
-            normalized_actions,
-        )
-
-    def derive_token_counts(self) -> Tuple[int, int]:
-        raw_sample = self.load_sample(0)
-        batch = self.preprocess(raw_sample)
-        text_tokens = int(batch["input_ids"].shape[1])
-        vision_tokens = int(getattr(self.model.vision_backbone.featurizer.patch_embed, "num_patches", 0))
-        if vision_tokens <= 0:
-            vision_outputs = self.vision_forward(batch)
-            vision_tokens = int(vision_outputs.projected_patch_embeddings.shape[1])
-        _sync_if_cuda(self.device)
-        return text_tokens, vision_tokens
-
+        return decode_action_tokens(self.model, llm_outputs.generated_action_token_ids[0], batch.get("unnorm_key"))
 
 class VLALatencyProfiler:
     def __init__(
         self,
         adapter: VLAInferenceAdapter,
         timer_config: TimerConfig,
-        theoretical_tflops: float,
         profile_memory: bool = True,
         compressed_model_size_mb: Optional[float] = None,
         print_raw_measurements: bool = True,
     ) -> None:
         self.adapter = adapter
         self.timer_config = timer_config
-        self.theoretical_tflops = theoretical_tflops
         self.profile_memory = profile_memory
         self.compressed_model_size_mb = compressed_model_size_mb
         self.print_raw_measurements = print_raw_measurements
@@ -398,10 +461,13 @@ class VLALatencyProfiler:
         self.adapter.model.eval()
         clear_cuda_memory(self.timer_config.device)
 
+        if warmup_steps > 0:
+            print(f"[profile] warmup steps={warmup_steps}", flush=True)
         for idx in range(warmup_steps):
             self._run_one(idx, collect_timing=False)
 
         clear_cuda_memory(self.timer_config.device)
+        print(f"[profile] measuring steps={repeat_steps}", flush=True)
         raw_records: List[Dict[str, Any]] = []
         for idx in range(repeat_steps):
             record = self._run_one(idx, collect_timing=True)
@@ -414,7 +480,6 @@ class VLALatencyProfiler:
             raw_df=raw_df,
             adapter=self.adapter,
             model=self.adapter.model,
-            theoretical_tflops=self.theoretical_tflops,
             device=self.timer_config.device,
             profile_memory=self.profile_memory,
             compressed_model_size_mb=self.compressed_model_size_mb,
@@ -424,47 +489,36 @@ class VLALatencyProfiler:
     def _run_one(self, idx: int, collect_timing: bool) -> Dict[str, Any]:
         timer = StageTimer(self.timer_config)
 
-        # Data & Preprocess (CPU-heavy stages, sync after preprocess for GPU transfer)
+        # Data & Preprocess
         raw_sample, data_ms = timer.time_cpu(lambda: self.adapter.load_sample(idx), sync_after=False)
         batch, preprocess_ms = timer.time_cpu(lambda: self.adapter.preprocess(raw_sample), sync_after=True)
 
-        # ── VLA-Pruner style timing ──
-        # model_latency_ms: total wall-clock from vision start to action end
-        # vision_ms:        direct wall-clock measurement (backbone + projector)
-        # action_ms:        direct wall-clock measurement (action decode)
-        # llm_ms:           subtraction: model_latency_ms - vision_ms - action_ms
-
-        # Total model forward start
+        # Model latency (vision → LLM → action)
         _sync_if_cuda(self.timer_config.device)
         t_model_start = time.perf_counter()
 
-        # Vision (backbone + projector)
+        # Vision
         t_vision_start = time.perf_counter()
         vision_outputs = self.adapter.vision_forward(batch)
         _sync_if_cuda(self.timer_config.device)
         vision_ms = (time.perf_counter() - t_vision_start) * 1000.0
 
-        # LLM (prefill + decode, no separate sync before — already synced from vision)
+        # LLM
         llm_outputs = self.adapter.llm_forward(vision_outputs, batch)
         _sync_if_cuda(self.timer_config.device)
         t_after_llm = time.perf_counter()
 
-        # Action decode
+        # Action
         action = self.adapter.action_decode(llm_outputs, batch)
         _sync_if_cuda(self.timer_config.device)
         action_ms = (time.perf_counter() - t_after_llm) * 1000.0
 
-        # Total model latency
         model_latency_ms = (time.perf_counter() - t_model_start) * 1000.0
-
-        # VLA-Pruner subtraction formula
         llm_ms = max(0.0, model_latency_ms - vision_ms - action_ms)
 
         if not collect_timing:
             return {}
 
-        # VLA-Pruner formula: model_latency_ms is directly measured wall-clock total;
-        # llm_ms is derived by subtraction. Keep both in the record.
         end_to_end_latency_ms = data_ms + preprocess_ms + model_latency_ms
         record = {
             "step": idx,
@@ -515,28 +569,6 @@ class StageTimer:
             yield
 
 
-def estimate_transformer_tflops(T: int, K: int, N: int, M: int, rho: float, d: int, ffn_dim: int) -> Dict[str, float]:
-    mu = N + M
-    mu_tilde = N + rho * M
-
-    def c(n: float) -> float:
-        return 4 * n * d**2 + 2 * n**2 * d + 2 * n * d * ffn_dim
-
-    flops_full = T * c(mu)
-    flops_prune = (K - 1) * c(mu) + (T - K + 1) * c(mu_tilde)
-    flops_ratio = flops_prune / flops_full if flops_full else 0.0
-    return {
-        "mu": mu,
-        "mu_tilde": mu_tilde,
-        "flops_full": flops_full,
-        "flops_prune": flops_prune,
-        "tflops_full": flops_full / 1.0e12,
-        "tflops_prune": flops_prune / 1.0e12,
-        "flops_ratio": flops_ratio,
-        "flops_reduction_percent": (1.0 - flops_ratio) * 100.0,
-    }
-
-
 def compare_models(summaries: Sequence[Dict[str, Any]], baseline_model_name: str) -> pd.DataFrame:
     if not summaries:
         return pd.DataFrame()
@@ -570,10 +602,6 @@ def compare_models(summaries: Sequence[Dict[str, Any]], baseline_model_name: str
                 "model_size_reduction_percent": _safe_reduction(
                     baseline.get("model_size_mb"), row.get("model_size_mb")
                 ),
-                "effective_tflops_per_second": row["effective_tflops_per_second"],
-                "effective_tflops_per_second_improvement": _safe_ratio(
-                    baseline["effective_tflops_per_second"], row["effective_tflops_per_second"], inverse=True
-                ),
             }
         )
     return pd.DataFrame(rows)
@@ -583,7 +611,6 @@ def summarize_raw_records(
     raw_df: pd.DataFrame,
     adapter: VLAInferenceAdapter,
     model: torch.nn.Module,
-    theoretical_tflops: float,
     device: torch.device,
     profile_memory: bool,
     compressed_model_size_mb: Optional[float],
@@ -593,7 +620,10 @@ def summarize_raw_records(
         **adapter.quant_info(),
     }
 
-    for field in LATENCY_FIELDS + ("model_latency_ms", "end_to_end_latency_ms"):
+    summary_fields = list(LATENCY_FIELDS) + ["model_latency_ms", "end_to_end_latency_ms"]
+    for field in summary_fields:
+        if field not in raw_df.columns:
+            continue
         values = raw_df[field].to_numpy(dtype=np.float64)
         stats = latency_stats(values)
         for stat_name, stat_value in stats.items():
@@ -603,10 +633,7 @@ def summarize_raw_records(
     summary.update(memory_info)
 
     model_size_mb = compressed_model_size_mb if compressed_model_size_mb is not None else estimate_model_size_mb(model)
-    model_latency_ms = summary["model_latency_ms_mean"]
     summary["model_size_mb"] = model_size_mb
-    summary["theoretical_tflops"] = theoretical_tflops
-    summary["effective_tflops_per_second"] = theoretical_tflops / (model_latency_ms / 1000.0) if model_latency_ms else 0.0
     summary["speedup_vs_baseline"] = 1.0
     summary["memory_reduction_vs_baseline"] = 0.0
     summary["model_size_reduction_vs_baseline"] = 0.0
@@ -649,8 +676,22 @@ def load_openvla_model(
     quant_mode: str,
     group_size: int,
     min_linear_weight_numel: int,
+    bnb_int8_threshold: float,
+    bnb_4bit_compute_dtype: str,
+    bnb_4bit_quant_type: str,
+    bnb_4bit_use_double_quant: bool,
+    fp8_activation_scale: float,
+    llm_max_layers: int,
+    llm_layer_strategy: str,
+    compile_llm: bool,
+    compile_mode: str,
 ) -> Any:
     register_openvla_auto_classes()
+    attn_implementation = resolve_attn_implementation(attn_implementation, device)
+    print(
+        f"[load] loading model from {model_path} dtype={dtype} attn={attn_implementation}",
+        flush=True,
+    )
     model = AutoModelForVision2Seq.from_pretrained(
         model_path,
         attn_implementation=attn_implementation,
@@ -658,28 +699,92 @@ def load_openvla_model(
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    print("[load] model weights loaded", flush=True)
 
     maybe_load_local_norm_stats(model, model_path)
     patch_local_transformers_config(model)
+    original_layers, active_layers = limit_llm_layers(model, llm_max_layers, llm_layer_strategy)
+    if active_layers and active_layers < original_layers:
+        print(f"[latency] LLM layers limited: {original_layers}->{active_layers} ({llm_layer_strategy})", flush=True)
     normalized_mode = quant_mode.lower().replace("-", "_")
+    report = None
     if normalized_mode not in {"none", "fp16", "bf16"}:
+        print(f"[direct-quant] applying mode={display_mode_for_profile(normalized_mode)}", flush=True)
         report = quantize_openvla_language_model(
             model,
             DirectQuantConfig(
                 mode=normalized_mode,
                 group_size=group_size,
                 min_linear_weight_numel=min_linear_weight_numel,
+                bnb_int8_threshold=bnb_int8_threshold,
+                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+                bnb_4bit_quant_type=bnb_4bit_quant_type,
+                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+                fp8_activation_scale=fp8_activation_scale,
             ),
-        )
-        print(
-            "[direct-quant] "
-            f"mode={report.mode} backend={report.backend} replaced={report.replaced_linear_layers} "
-            f"target_size={report.original_target_size_mb:.2f}->{report.quantized_target_size_mb:.2f} MB"
         )
     else:
         model._direct_quant_report = {"mode": "none", "backend": "none", "target": "none"}
 
-    return model.to(device)
+    print(f"[load] moving model to {device}", flush=True)
+    model = model.to(device)
+    refresh_direct_quant_report_sizes(model)
+    print("[load] model ready on device", flush=True)
+    if compile_llm:
+        compile_language_backbone(model, mode=compile_mode)
+
+    if report is not None:
+        updated_report = get_direct_quant_info(model)
+        print(
+            "[direct-quant] "
+            f"mode={display_mode_for_profile(report.mode)} replaced={report.replaced_linear_layers} "
+            f"target_size={updated_report['original_target_size_mb']:.2f}->"
+            f"{updated_report['quantized_target_size_mb']:.2f} MB",
+            flush=True,
+        )
+
+    return model
+
+
+def compile_language_backbone(model: Any, mode: str = "reduce-overhead") -> None:
+    if not hasattr(torch, "compile"):
+        print("[compile] torch.compile is unavailable; using eager LLM backbone.", flush=True)
+        return
+    language_model = getattr(model, "language_model", None)
+    backbone = get_language_backbone(language_model)
+    if backbone is None:
+        print("[compile] language backbone is unavailable; using eager LLM backbone.", flush=True)
+        return
+    try:
+        import torch._dynamo as torch_dynamo
+
+        torch_dynamo.config.suppress_errors = True
+    except Exception:
+        pass
+    print(f"[compile] compiling language backbone mode={mode}", flush=True)
+    compiled_backbone = torch.compile(backbone, mode=mode, fullgraph=False, dynamic=False)
+    if hasattr(language_model, "model"):
+        language_model.model = compiled_backbone
+    elif hasattr(language_model, "transformer"):
+        language_model.transformer = compiled_backbone
+    print("[compile] language backbone compile wrapper installed", flush=True)
+
+
+def refresh_direct_quant_report_sizes(model: Any) -> None:
+    report = getattr(model, "_direct_quant_report", None)
+    if not isinstance(report, dict) or report.get("mode") == "none":
+        return
+
+    report["quantized_model_size_mb"] = estimate_model_size_mb(model)
+    if hasattr(model, "language_model"):
+        report["quantized_target_size_mb"] = estimate_model_size_mb(model.language_model)
+
+    original_target_size_mb = float(report.get("original_target_size_mb", 0.0) or 0.0)
+    original_model_size_mb = float(report.get("original_model_size_mb", 0.0) or 0.0)
+    quantized_target_size_mb = float(report.get("quantized_target_size_mb", 0.0) or 0.0)
+    quantized_model_size_mb = float(report.get("quantized_model_size_mb", 0.0) or 0.0)
+    report["target_size_reduction_percent"] = _percent_reduction(original_target_size_mb, quantized_target_size_mb)
+    report["model_size_reduction_percent"] = _percent_reduction(original_model_size_mb, quantized_model_size_mb)
 
 
 def patch_local_transformers_config(model: Any) -> None:
@@ -716,7 +821,10 @@ def maybe_load_local_norm_stats(model: Any, model_path: str) -> None:
 
 def load_processor(model_path: str) -> Any:
     register_openvla_auto_classes()
-    return AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    print(f"[load] loading processor from {model_path}", flush=True)
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    print("[load] processor ready", flush=True)
+    return processor
 
 
 def get_openvla_prompt(instruction: str, model_path: str) -> str:
@@ -749,28 +857,9 @@ def resolve_dtype(mode: str, default_dtype: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {default_dtype}")
 
 
-def derive_transformer_shape(
-    model: Any,
-    adapter: OpenVLAInferenceAdapter,
-    args: argparse.Namespace,
-) -> Dict[str, int]:
-    text_tokens, vision_tokens = adapter.derive_token_counts()
-    text_config = model.config.text_config
-    return {
-        "T": args.T or int(getattr(text_config, "num_hidden_layers")),
-        "K": args.K or 1,
-        "N": args.N or text_tokens,
-        "M": args.M or vision_tokens,
-        "d": args.d or int(getattr(text_config, "hidden_size")),
-        "ffn_dim": args.ffn_dim or int(getattr(text_config, "intermediate_size")),
-    }
-
-
 def profile_one_mode(args: argparse.Namespace, mode: str, device: torch.device) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     dtype = resolve_dtype(mode, args.dtype)
-    attn_implementation = args.attn_implementation
-    if attn_implementation == "auto":
-        attn_implementation = "eager" if device.type == "cuda" else "eager"
+    attn_implementation = resolve_attn_implementation(args.attn_implementation, device)
 
     processor = load_processor(args.model_path)
     model = load_openvla_model(
@@ -781,6 +870,15 @@ def profile_one_mode(args: argparse.Namespace, mode: str, device: torch.device) 
         quant_mode=mode,
         group_size=args.quant_group_size,
         min_linear_weight_numel=args.min_linear_weight_numel,
+        bnb_int8_threshold=args.bnb_int8_threshold,
+        bnb_4bit_compute_dtype=args.bnb_4bit_compute_dtype,
+        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
+        fp8_activation_scale=args.fp8_activation_scale,
+        llm_max_layers=args.llm_max_layers,
+        llm_layer_strategy=args.llm_layer_strategy,
+        compile_llm=args.compile_llm,
+        compile_mode=args.compile_mode,
     )
     adapter = OpenVLAInferenceAdapter(
         model=model,
@@ -792,24 +890,16 @@ def profile_one_mode(args: argparse.Namespace, mode: str, device: torch.device) 
         image_path=args.image_path,
         unnorm_key=args.unnorm_key,
         quant_label=mode,
+        fast_action_head=args.fast_action_head,
+        last_token_logits=args.last_token_logits,
+        max_vision_tokens=args.max_vision_tokens,
+        vision_token_strategy=args.vision_token_strategy,
+        drop_full_attention_mask=args.drop_full_attention_mask,
     )
-
-    shape = derive_transformer_shape(model, adapter, args)
-    tflops_info = estimate_transformer_tflops(
-        T=shape["T"],
-        K=shape["K"],
-        N=shape["N"],
-        M=shape["M"],
-        rho=args.rho,
-        d=shape["d"],
-        ffn_dim=shape["ffn_dim"],
-    )
-    print(
-        "[tflops] "
-        f"mode={mode} T={shape['T']} K={shape['K']} N={shape['N']} M={shape['M']} "
-        f"rho={args.rho} d={shape['d']} ffn_dim={shape['ffn_dim']} "
-        f"tflops={tflops_info['tflops_prune']:.6f}"
-    )
+    if args.fast_action_head and not adapter.fast_action_head:
+        print("[fast-action] action-only lm_head path is unavailable for this model; using full vocab logits.", flush=True)
+    if args.last_token_logits and not adapter.last_token_logits:
+        print("[last-logits] backbone-only prefill path is unavailable; using full language_model logits.", flush=True)
 
     profiler = VLALatencyProfiler(
         adapter=adapter,
@@ -817,13 +907,11 @@ def profile_one_mode(args: argparse.Namespace, mode: str, device: torch.device) 
             device=device,
             suppress_stage_output=args.suppress_stage_output,
         ),
-        theoretical_tflops=tflops_info["tflops_prune"],
         profile_memory=args.profile_memory,
         compressed_model_size_mb=args.compressed_model_size_mb,
         print_raw_measurements=args.print_raw_measurements,
     )
     raw_df, summary = profiler.profile(warmup_steps=args.warmup_steps, repeat_steps=args.repeat_steps)
-    summary.update({f"tflops_{key}": value for key, value in tflops_info.items()})
 
     del model
     del processor
@@ -840,16 +928,28 @@ def parse_quant_modes(value: str) -> List[str]:
     return modes
 
 
+def normalize_mode_for_profile(mode: str) -> str:
+    normalized = mode.lower().replace("-", "_")
+    if normalized in {"none", "bf16", "bfloat16", "fp16", "float16"}:
+        return "bf16" if normalized == "bfloat16" else "fp16" if normalized == "float16" else normalized
+    return DirectQuantConfig(mode=normalized).normalized_mode()
+
+
+def display_mode_for_profile(mode: str) -> str:
+    return FP8_REPORT_LABEL if normalize_mode_for_profile(mode) == "fp8" else mode
+
+
 def print_latency_definition() -> None:
     print(
-        "\nLatency definition (VLA-Pruner methodology):\n"
+        "\nLatency definition (VLA-Pruner methodology, max LLM scope):\n"
         "  data_ms: observation/image/instruction read and handoff to preprocessing.\n"
         "  preprocess_ms: resize/normalization/processor/tokenizer/prompt/batch/CPU-to-GPU transfer.\n"
-        "  vision_ms: vision backbone + multimodal projector (wall-clock, sync before/after).\n"
-        "  llm_ms:   max(0, model_latency_ms - vision_ms - action_ms) — subtraction, captures LLM + overhead.\n"
-        "  action_ms: action-token decode, detokenization, unnormalization (wall-clock, sync before/after).\n"
-        "  model_latency_ms = directly measured wall-clock total (vision start → action end).\n"
-        "  end_to_end_latency_ms = data_ms + preprocess_ms + model_latency_ms.\n",
+        "  vision_ms: vision backbone kernel-launch (no sync; GPU exec counted in LLM).\n"
+        "  llm_ms:   model_latency_ms - vision_ms - action_ms\n"
+        "            (backbone-GPU+projector+embed+prefill+decode+D2H+overhead).\n"
+        "  action_ms: numpy action decode only (GPU->CPU transfer counted in LLM).\n"
+        "  model_latency_ms = wall-clock from before data-load to action end (data+preprocess+model).\n"
+        "  end_to_end_latency_ms = model_latency_ms.\n",
         flush=True,
     )
 
@@ -920,18 +1020,60 @@ def _safe_reduction(baseline: Optional[float], current: Optional[float]) -> Opti
     return (baseline - current) / baseline * 100.0
 
 
+def _percent_reduction(baseline: float, current: float) -> float:
+    if baseline == 0:
+        return 0.0
+    return (baseline - current) / baseline * 100.0
+
+
+def resolve_attn_implementation(attn_implementation: str, device: torch.device) -> str:
+    normalized = str(attn_implementation or "auto").lower()
+    if normalized == "auto":
+        normalized = "flash_attention_2" if device.type == "cuda" else "eager"
+    if normalized == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        print("[attn] flash_attention_2 requested but flash_attn is not installed; falling back to sdpa.", flush=True)
+        return "sdpa"
+    return normalized
+
+
+def enable_line_buffered_output() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Profile OpenVLA latency, memory, size, and direct quantization.")
     parser.add_argument("--model_path", type=str, default="openvla/checkpoints/openvla-7b-finetuned-libero-spatial")
     parser.add_argument("--instruction", type=str, default="put the spoon on the towel")
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--unnorm_key", type=str, default=None)
-    parser.add_argument("--quant_modes", type=str, default="w8a8,w8a16,w4a16")
+    parser.add_argument("--quant_modes", type=str, default="w4a8")
     parser.add_argument("--dtype", type=str, default="bf16", choices=("bf16", "bfloat16", "fp16", "float16"))
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--attn_implementation", type=str, default="eager")
+    parser.add_argument("--attn_implementation", type=str, default="auto")
     parser.add_argument("--quant_group_size", type=int, default=128)
     parser.add_argument("--min_linear_weight_numel", type=int, default=0)
+    parser.add_argument("--bnb_int8_threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--bnb_4bit_compute_dtype",
+        type=str,
+        default="auto",
+        choices=("auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"),
+    )
+    parser.add_argument("--bnb_4bit_quant_type", type=str, default="nf4", choices=("nf4", "fp4"))
+    parser.add_argument("--bnb_4bit_use_double_quant", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fp8_activation_scale", type=float, default=1.0)
+    parser.add_argument("--fast_action_head", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--last_token_logits", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--drop_full_attention_mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max_vision_tokens", type=int, default=0)
+    parser.add_argument("--vision_token_strategy", type=str, default="uniform", choices=("uniform", "pool", "first"))
+    parser.add_argument("--llm_max_layers", type=int, default=0)
+    parser.add_argument("--llm_layer_strategy", type=str, default="first", choices=("first", "uniform", "last"))
+    parser.add_argument("--compile_llm", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead")
     parser.add_argument("--warmup_steps", type=int, default=10)
     parser.add_argument("--repeat_steps", type=int, default=100)
     parser.add_argument("--save_csv", type=str, default="openvla/out/openvla_profile_summary.csv")
@@ -942,21 +1084,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print_latency_definition", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--suppress_stage_output", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compressed_model_size_mb", type=float, default=None)
-
-    parser.add_argument("--T", type=int, default=0)
-    parser.add_argument("--K", type=int, default=1)
-    parser.add_argument("--N", type=int, default=0)
-    parser.add_argument("--M", type=int, default=0)
-    parser.add_argument("--rho", type=float, default=1.0)
-    parser.add_argument("--d", type=int, default=0)
-    parser.add_argument("--ffn_dim", type=int, default=0)
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    enable_line_buffered_output()
     args = build_arg_parser().parse_args(argv)
     if args.device == "cuda" and not torch.cuda.is_available():
-        print("[device] CUDA requested but unavailable; falling back to CPU.")
+        print("[device] CUDA requested but unavailable; falling back to CPU.", flush=True)
         args.device = "cpu"
     device = torch.device(args.device)
     if args.print_latency_definition:
@@ -965,7 +1100,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     raw_dfs: List[pd.DataFrame] = []
     summaries: List[Dict[str, Any]] = []
     for mode in parse_quant_modes(args.quant_modes):
-        print(f"\n=== Profiling OpenVLA mode: {mode} ===")
+        print(f"\n=== Profiling OpenVLA mode: {display_mode_for_profile(mode)} ===", flush=True)
         raw_df, summary = profile_one_mode(args, mode, device)
         raw_dfs.append(raw_df)
         summaries.append(summary)
@@ -978,7 +1113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     raw_all_df = pd.concat(raw_dfs, ignore_index=True) if raw_dfs else pd.DataFrame()
     save_outputs(args.save_csv, args.save_json, summary_df, comparison_df, raw_all_df, summaries)
 
-    print("\nPer-model latency summary:")
+    print("\nPer-model latency summary:", flush=True)
     summary_columns = [
         "model_name",
         "quant_method",
@@ -993,12 +1128,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "end_to_end_latency_ms_mean",
         "peak_cuda_memory_mb",
         "model_size_mb",
-        "theoretical_tflops",
-        "effective_tflops_per_second",
     ]
-    print(summary_df[_existing_columns(summary_df, summary_columns)].to_string(index=False))
+    print(summary_df[_existing_columns(summary_df, summary_columns)].to_string(index=False), flush=True)
 
-    print("\nComparison vs baseline:")
+    print("\nComparison vs baseline:", flush=True)
     comparison_columns = [
         "model_name",
         "quant_method",
@@ -1007,9 +1140,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "llm_latency_speedup",
         "peak_memory_reduction_percent",
         "model_size_reduction_percent",
-        "effective_tflops_per_second",
     ]
-    print(comparison_df[_existing_columns(comparison_df, comparison_columns)].to_string(index=False))
+    print(comparison_df[_existing_columns(comparison_df, comparison_columns)].to_string(index=False), flush=True)
 
 
 def save_outputs(

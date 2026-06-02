@@ -6,7 +6,6 @@ TASK="${2:-libero_10}"
 OUT_ROOT="${3:-results/benchmarks}"
 WARMUP="${QVLA_WARMUP:-5}"
 ITERS="${QVLA_ITERS:-20}"
-DENOISING_STEPS="${QVLA_DENOISING_STEPS:-8}"
 ACTION_SAMPLES="${QVLA_ACTION_SAMPLES:-32}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,10 +31,12 @@ case "$VARIANT" in
     ;;
 esac
 
+DENOISING_STEPS="$(quantvla_resolve_denoising_steps)"
 OUT_DIR="$OUT_ROOT/$QVLA_VARIANT/$QVLA_TASK"
 mkdir -p "$OUT_DIR"
 
 echo "[QuantVLA] Writing local benchmark outputs to $OUT_DIR"
+echo "[QuantVLA] denoising steps: $DENOISING_STEPS"
 
 python tools/benchmark_gr00t_latency.py \
   --mode local \
