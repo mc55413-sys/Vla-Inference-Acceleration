@@ -1,0 +1,26 @@
+services:
+  cache-openvla:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cache-openvla:latest
+    ipc: host
+    network_mode: host
+    shm_size: "16gb"
+    working_dir: /workspace/Cache_Openvla
+    environment:
+      PYTHON_BIN: python3
+      CHECKPOINT_PATH: /workspace/checkpoints/openvla-7b-finetuned-libero-spatial
+      MUJOCO_GL: egl
+      TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - .:/workspace/Cache_Openvla
+      - ${CHECKPOINT_DIR:-./checkpoints}:/workspace/checkpoints:ro
+      - ${CACHE_OPENVLA_RESULTS_DIR:-./docker_results}:/workspace/Cache_Openvla/docker_results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
